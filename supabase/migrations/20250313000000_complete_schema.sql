@@ -1,11 +1,9 @@
-
 /*
-  # Complete Database Schema
+  Complete Database Schema
 
-  This single migration file contains all necessary database objects:
-  - Tables: settings (projects), notes, note_sequences
+  This single migration contains everything needed for a fresh database setup:
+  - Tables: settings (corresponds to "projects" in code), notes, note_sequences
   - Functions: move_note, delete_note_tree, soft_delete_project, restore_project
-  - Storage setup for note images
   - RLS policies for security
 */
 
@@ -17,6 +15,7 @@ CREATE TABLE IF NOT EXISTS settings (
   created_at timestamptz NOT NULL DEFAULT NOW(),
   last_modified_at timestamptz NOT NULL DEFAULT NOW(),
   note_count integer NOT NULL DEFAULT 0,
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
   deleted_at timestamptz DEFAULT NULL
 );
 
@@ -26,7 +25,8 @@ CREATE TABLE IF NOT EXISTS notes (
   parent_id uuid REFERENCES notes(id) ON DELETE CASCADE,
   content text NOT NULL DEFAULT '',
   created_at timestamptz NOT NULL DEFAULT NOW(),
-  updated_at timestamptz NOT NULL DEFAULT NOW()
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  user_id uuid NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS note_sequences (
@@ -39,143 +39,85 @@ CREATE TABLE IF NOT EXISTS note_sequences (
 
 -- Create function to move notes
 CREATE OR REPLACE FUNCTION move_note(
-  p_note_id uuid,
-  p_new_parent_id uuid,
-  p_new_position integer
+  note_id_param uuid,
+  new_parent_id_param uuid,
+  new_sequence_param integer
 ) RETURNS void AS $$
 DECLARE
-  v_project_id uuid;
-  v_old_parent_id uuid;
-  v_old_sequence integer;
-  v_max_sequence integer;
-  v_temp_sequence integer := 9999999;  -- Very high temporary sequence
+  current_parent_id uuid;
+  current_sequence integer;
+  project_id_val uuid;
+  temp_sequence integer := 999999; -- Use a temporary high sequence to avoid conflicts
 BEGIN
-  -- Get current note info
-  SELECT project_id, parent_id, sequence
-  INTO v_project_id, v_old_parent_id, v_old_sequence
-  FROM note_sequences
-  WHERE note_id = p_note_id;
+  -- Get current values
+  SELECT 
+    ns.parent_id, 
+    ns.sequence, 
+    ns.project_id
+  INTO 
+    current_parent_id, 
+    current_sequence, 
+    project_id_val
+  FROM 
+    note_sequences ns
+  WHERE 
+    ns.note_id = note_id_param;
 
-  IF v_project_id IS NULL THEN
-    RAISE EXCEPTION 'Note with ID % not found in note_sequences', p_note_id;
+  -- If not found, exit
+  IF project_id_val IS NULL THEN
+    RAISE EXCEPTION 'Note sequence not found';
+    RETURN;
   END IF;
 
-  -- Get max sequence at target level
-  SELECT COALESCE(MAX(sequence), 0)
-  INTO v_max_sequence
-  FROM note_sequences
-  WHERE project_id = v_project_id
-  AND parent_id IS NOT DISTINCT FROM p_new_parent_id;
+  -- Step 1: Temporarily move note to a very high sequence to avoid conflicts
+  UPDATE note_sequences
+  SET sequence = temp_sequence
+  WHERE note_id = note_id_param;
 
-  -- Ensure position is valid
-  p_new_position := GREATEST(1, LEAST(p_new_position, v_max_sequence + 1));
+  -- Step 2: Update the original position - close the gap
+  UPDATE note_sequences
+  SET sequence = sequence - 1
+  WHERE 
+    project_id = project_id_val 
+    AND parent_id IS NOT DISTINCT FROM current_parent_id
+    AND sequence > current_sequence;
 
-  -- STEP 1: First move to a temporary high sequence to avoid conflicts
-  -- This avoids the unique constraint violation
+  -- Step 3: Make space at the destination
+  UPDATE note_sequences
+  SET sequence = sequence + 1
+  WHERE 
+    project_id = project_id_val 
+    AND parent_id IS NOT DISTINCT FROM new_parent_id_param
+    AND sequence >= new_sequence_param;
+
+  -- Step 4: Move the note to its final destination
   UPDATE note_sequences
   SET 
-    sequence = v_temp_sequence
-  WHERE note_id = p_note_id;
-
-  -- STEP 2: Update parent in notes table
-  UPDATE notes
-  SET parent_id = p_new_parent_id
-  WHERE id = p_note_id;
-
-  -- STEP 3: Handle sequence updates based on movement type
-  IF v_old_parent_id IS NOT DISTINCT FROM p_new_parent_id THEN
-    -- Moving within same parent
-    IF v_old_sequence < p_new_position THEN
-      -- Moving forward
-      UPDATE note_sequences
-      SET sequence = sequence - 1
-      WHERE project_id = v_project_id
-      AND parent_id IS NOT DISTINCT FROM p_new_parent_id
-      AND sequence > v_old_sequence
-      AND sequence <= p_new_position;
-    ELSE
-      -- Moving backward
-      UPDATE note_sequences
-      SET sequence = sequence + 1
-      WHERE project_id = v_project_id
-      AND parent_id IS NOT DISTINCT FROM p_new_parent_id
-      AND sequence >= p_new_position
-      AND sequence < v_old_sequence;
-    END IF;
-  ELSE
-    -- Moving to different parent
-    -- Close gap in old parent
-    UPDATE note_sequences
-    SET sequence = sequence - 1
-    WHERE project_id = v_project_id
-    AND parent_id IS NOT DISTINCT FROM v_old_parent_id
-    AND sequence > v_old_sequence;
-
-    -- Make space in new parent
-    UPDATE note_sequences
-    SET sequence = sequence + 1
-    WHERE project_id = v_project_id
-    AND parent_id IS NOT DISTINCT FROM p_new_parent_id
-    AND sequence >= p_new_position;
-  END IF;
-
-  -- STEP 4: Finally, move note to its target position and parent
-  UPDATE note_sequences
-  SET 
-    parent_id = p_new_parent_id,
-    sequence = p_new_position
-  WHERE note_id = p_note_id;
+    parent_id = new_parent_id_param,
+    sequence = new_sequence_param
+  WHERE note_id = note_id_param;
 END;
 $$ LANGUAGE plpgsql;
 
--- Create function to delete note tree
-CREATE OR REPLACE FUNCTION delete_note_tree(root_note_id uuid)
+-- Function to delete a note and its children recursively
+CREATE OR REPLACE FUNCTION delete_note_tree(note_id_param uuid)
 RETURNS void AS $$
 DECLARE
-  target_project_id uuid;
-  notes_to_delete uuid[];
+  child_id uuid;
 BEGIN
-  -- Get the project id
-  SELECT project_id INTO target_project_id
-  FROM notes
-  WHERE id = root_note_id;
-  
-  -- Recursively collect all note IDs to delete
-  WITH RECURSIVE descendants AS (
-    -- Base case: the root note
-    SELECT id, parent_id, 1 AS depth
-    FROM notes
-    WHERE id = root_note_id
-    
-    UNION ALL
-    
-    -- Recursive case: direct children only, limiting recursion depth
-    SELECT n.id, n.parent_id, d.depth + 1
+  -- First, recursively delete all children
+  FOR child_id IN (
+    SELECT n.id 
     FROM notes n
-    INNER JOIN descendants d ON n.parent_id = d.id
-    WHERE d.depth < 50 -- Reasonable limit to prevent deep recursion
+    JOIN note_sequences ns ON n.id = ns.note_id
+    WHERE ns.parent_id = note_id_param
   )
-  SELECT array_agg(id) INTO notes_to_delete
-  FROM descendants;
+  LOOP
+    PERFORM delete_note_tree(child_id);
+  END LOOP;
 
-  -- Delete the note sequences entries first to maintain referential integrity
-  DELETE FROM note_sequences
-  WHERE note_id = ANY(notes_to_delete);
-
-  -- Delete all collected notes
-  DELETE FROM notes
-  WHERE id = ANY(notes_to_delete);
-
-  -- Update project metadata
-  UPDATE settings s
-  SET 
-    note_count = (
-      SELECT COUNT(*)
-      FROM notes n
-      WHERE n.project_id = target_project_id
-    ),
-    last_modified_at = CURRENT_TIMESTAMP
-  WHERE s.id = target_project_id;
+  -- Then delete the note itself and its sequence
+  DELETE FROM notes WHERE id = note_id_param;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -203,14 +145,22 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Create storage bucket for note images
+-- Create storage bucket for note images if needed
 DO $$ 
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM storage.buckets WHERE id = 'note-images'
+    SELECT 1 FROM pg_extension WHERE extname = 'storage'
   ) THEN
-    INSERT INTO storage.buckets (id, name, public)
-    VALUES ('note-images', 'note-images', true);
+    -- Skip if storage extension isn't available
+    RAISE NOTICE 'Storage extension not available, skipping bucket creation';
+  ELSE
+    -- Only try to create bucket if storage extension exists
+    IF NOT EXISTS (
+      SELECT 1 FROM storage.buckets WHERE id = 'note-images'
+    ) THEN
+      INSERT INTO storage.buckets (id, name, public)
+      VALUES ('note-images', 'note-images', true);
+    END IF;
   END IF;
 END $$;
 
@@ -218,7 +168,6 @@ END $$;
 ALTER TABLE settings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE note_sequences ENABLE ROW LEVEL SECURITY;
-ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
 
 -- Create RLS policies for settings table
 CREATE POLICY "Users can read own settings" ON settings
@@ -237,10 +186,6 @@ CREATE POLICY "Users can insert own settings" ON settings
 CREATE POLICY "Users can update own settings" ON settings
   FOR UPDATE TO authenticated
   USING (
-    user_id = auth.uid() 
-    AND deleted_at IS NULL
-  )
-  WITH CHECK (
     user_id = auth.uid()
   );
 
@@ -248,129 +193,44 @@ CREATE POLICY "Users can update own settings" ON settings
 CREATE POLICY "Users can read own notes" ON notes
   FOR SELECT TO authenticated
   USING (
-    EXISTS (
-      SELECT 1 FROM settings s
-      WHERE s.id = project_id
-      AND s.user_id = auth.uid()
-      AND s.deleted_at IS NULL
-    )
+    user_id = auth.uid()
   );
 
 CREATE POLICY "Users can insert own notes" ON notes
   FOR INSERT TO authenticated
   WITH CHECK (
-    EXISTS (
-      SELECT 1 FROM settings s
-      WHERE s.id = project_id
-      AND s.user_id = auth.uid()
-      AND s.deleted_at IS NULL
-    )
+    user_id = auth.uid()
   );
 
 CREATE POLICY "Users can update own notes" ON notes
   FOR UPDATE TO authenticated
   USING (
-    EXISTS (
-      SELECT 1 FROM settings s
-      WHERE s.id = project_id
-      AND s.user_id = auth.uid()
-      AND s.deleted_at IS NULL
-    )
-  )
-  WITH CHECK (
-    EXISTS (
-      SELECT 1 FROM settings s
-      WHERE s.id = project_id
-      AND s.user_id = auth.uid()
-      AND s.deleted_at IS NULL
-    )
+    user_id = auth.uid()
   );
 
 CREATE POLICY "Users can delete own notes" ON notes
   FOR DELETE TO authenticated
   USING (
-    EXISTS (
-      SELECT 1 FROM settings s
-      WHERE s.id = project_id
-      AND s.user_id = auth.uid()
-      AND s.deleted_at IS NULL
-    )
+    user_id = auth.uid()
   );
 
 -- Create RLS policies for note_sequences table
-CREATE POLICY "Users can read own note sequences" ON note_sequences
+CREATE POLICY "Users can read note sequences through parent notes" ON note_sequences
   FOR SELECT TO authenticated
   USING (
     EXISTS (
-      SELECT 1 FROM settings s
-      WHERE s.id = project_id
-      AND s.user_id = auth.uid()
-      AND s.deleted_at IS NULL
+      SELECT 1 FROM notes n
+      WHERE n.id = note_id
+      AND n.user_id = auth.uid()
     )
   );
 
-CREATE POLICY "Users can insert own note sequences" ON note_sequences
-  FOR INSERT TO authenticated
-  WITH CHECK (
-    EXISTS (
-      SELECT 1 FROM settings s
-      WHERE s.id = project_id
-      AND s.user_id = auth.uid()
-      AND s.deleted_at IS NULL
-    )
-  );
-
-CREATE POLICY "Users can update own note sequences" ON note_sequences
-  FOR UPDATE TO authenticated
+CREATE POLICY "Users can modify note sequences through parent notes" ON note_sequences
+  FOR ALL TO authenticated
   USING (
     EXISTS (
-      SELECT 1 FROM settings s
-      WHERE s.id = project_id
-      AND s.user_id = auth.uid()
-      AND s.deleted_at IS NULL
+      SELECT 1 FROM notes n
+      WHERE n.id = note_id
+      AND n.user_id = auth.uid()
     )
-  )
-  WITH CHECK (
-    EXISTS (
-      SELECT 1 FROM settings s
-      WHERE s.id = project_id
-      AND s.user_id = auth.uid()
-      AND s.deleted_at IS NULL
-    )
-  );
-
-CREATE POLICY "Users can delete own note sequences" ON note_sequences
-  FOR DELETE TO authenticated
-  USING (
-    EXISTS (
-      SELECT 1 FROM settings s
-      WHERE s.id = project_id
-      AND s.user_id = auth.uid()
-      AND s.deleted_at IS NULL
-    )
-  );
-
--- Create RLS policies for storage
-CREATE POLICY "Users can upload note images"
-  ON storage.objects
-  FOR INSERT
-  TO authenticated
-  WITH CHECK (
-    bucket_id = 'note-images' AND
-    (storage.foldername(name))[1] = auth.uid()::text
-  );
-
-CREATE POLICY "Anyone can view note images"
-  ON storage.objects
-  FOR SELECT
-  TO public
-  USING (bucket_id = 'note-images');
-
-CREATE POLICY "Users can delete their note images"
-  ON storage.objects
-  FOR DELETE
-  TO authenticated
-  USING (
-    bucket_id = 'note-images' AND
-    (storage.foldername(name))[1] = auth.uid()::text
   );
