@@ -37,76 +37,6 @@ CREATE TABLE IF NOT EXISTS note_sequences (
   UNIQUE (project_id, parent_id, sequence)
 );
 
--- Create note_images table for image storage
-CREATE TABLE IF NOT EXISTS note_images (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  note_id uuid NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-  storage_path text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT NOW()
-);
-
--- Create storage bucket for note images
-DO $$ 
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM storage.buckets WHERE id = 'note-images'
-  ) THEN
-    INSERT INTO storage.buckets (id, name, public)
-    VALUES ('note-images', 'note-images', true);
-  END IF;
-END $$;
-
--- Create storage policies
-CREATE POLICY "Users can upload note images"
-  ON storage.objects
-  FOR INSERT
-  TO authenticated
-  WITH CHECK (
-    bucket_id = 'note-images' AND
-    (storage.foldername(name))[1] = auth.uid()::text
-  );
-
-CREATE POLICY "Anyone can view note images"
-  ON storage.objects
-  FOR SELECT
-  TO public
-  USING (bucket_id = 'note-images');
-
-CREATE POLICY "Users can delete their note images"
-  ON storage.objects
-  FOR DELETE
-  TO authenticated
-  USING (
-    bucket_id = 'note-images' AND
-    (storage.foldername(name))[1] = auth.uid()::text
-  );
-
--- Create function to clean up storage when images are deleted
-CREATE OR REPLACE FUNCTION delete_storage_object()
-RETURNS TRIGGER AS $$
-BEGIN
-  -- Only attempt to delete if storage_path exists
-  IF OLD.storage_path IS NOT NULL THEN
-    -- Delete file from storage
-    PERFORM net.http_post(
-      url := current_setting('supabase_functions_endpoint') || '/storage/v1/object/note-images/' || OLD.storage_path,
-      headers := jsonb_build_object(
-        'Authorization', 'Bearer ' || current_setting('supabase.auth.anon_key'),
-        'Content-Type', 'application/json'
-      ),
-      body := '{}'
-    );
-  END IF;
-  RETURN OLD;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- Trigger for storage cleanup
-CREATE TRIGGER delete_note_image_storage_trigger
-  BEFORE DELETE ON note_images
-  FOR EACH ROW
-  EXECUTE FUNCTION delete_storage_object();
-
 -- Create function to move notes
 CREATE OR REPLACE FUNCTION move_note(
   p_note_id uuid,
@@ -249,7 +179,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Create function to soft delete projects
+-- Create function to soft delete project
 CREATE OR REPLACE FUNCTION soft_delete_project(project_id uuid)
 RETURNS void AS $$
 BEGIN
@@ -261,7 +191,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Create function to restore projects
+-- Create function to restore project
 CREATE OR REPLACE FUNCTION restore_project(project_id uuid)
 RETURNS void AS $$
 BEGIN
@@ -273,7 +203,24 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- RLS policies for settings/projects
+-- Create storage bucket for note images
+DO $$ 
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM storage.buckets WHERE id = 'note-images'
+  ) THEN
+    INSERT INTO storage.buckets (id, name, public)
+    VALUES ('note-images', 'note-images', true);
+  END IF;
+END $$;
+
+-- Enable RLS on tables
+ALTER TABLE settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE note_sequences ENABLE ROW LEVEL SECURITY;
+ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
+
+-- Create RLS policies for settings table
 CREATE POLICY "Users can read own settings" ON settings
   FOR SELECT TO authenticated
   USING (
@@ -297,13 +244,13 @@ CREATE POLICY "Users can update own settings" ON settings
     user_id = auth.uid()
   );
 
--- RLS policies for notes
+-- Create RLS policies for notes table
 CREATE POLICY "Users can read own notes" ON notes
   FOR SELECT TO authenticated
   USING (
     EXISTS (
       SELECT 1 FROM settings s
-      WHERE s.id = notes.project_id
+      WHERE s.id = project_id
       AND s.user_id = auth.uid()
       AND s.deleted_at IS NULL
     )
@@ -314,7 +261,7 @@ CREATE POLICY "Users can insert own notes" ON notes
   WITH CHECK (
     EXISTS (
       SELECT 1 FROM settings s
-      WHERE s.id = notes.project_id
+      WHERE s.id = project_id
       AND s.user_id = auth.uid()
       AND s.deleted_at IS NULL
     )
@@ -325,7 +272,15 @@ CREATE POLICY "Users can update own notes" ON notes
   USING (
     EXISTS (
       SELECT 1 FROM settings s
-      WHERE s.id = notes.project_id
+      WHERE s.id = project_id
+      AND s.user_id = auth.uid()
+      AND s.deleted_at IS NULL
+    )
+  )
+  WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM settings s
+      WHERE s.id = project_id
       AND s.user_id = auth.uid()
       AND s.deleted_at IS NULL
     )
@@ -336,59 +291,86 @@ CREATE POLICY "Users can delete own notes" ON notes
   USING (
     EXISTS (
       SELECT 1 FROM settings s
-      WHERE s.id = notes.project_id
+      WHERE s.id = project_id
       AND s.user_id = auth.uid()
       AND s.deleted_at IS NULL
     )
   );
 
--- RLS policies for note_sequences
-CREATE POLICY "Users can read own note_sequences" ON note_sequences
+-- Create RLS policies for note_sequences table
+CREATE POLICY "Users can read own note sequences" ON note_sequences
   FOR SELECT TO authenticated
   USING (
     EXISTS (
       SELECT 1 FROM settings s
-      WHERE s.id = note_sequences.project_id
+      WHERE s.id = project_id
       AND s.user_id = auth.uid()
       AND s.deleted_at IS NULL
     )
   );
 
-CREATE POLICY "Users can insert own note_sequences" ON note_sequences
+CREATE POLICY "Users can insert own note sequences" ON note_sequences
   FOR INSERT TO authenticated
   WITH CHECK (
     EXISTS (
       SELECT 1 FROM settings s
-      WHERE s.id = note_sequences.project_id
+      WHERE s.id = project_id
       AND s.user_id = auth.uid()
       AND s.deleted_at IS NULL
     )
   );
 
-CREATE POLICY "Users can update own note_sequences" ON note_sequences
+CREATE POLICY "Users can update own note sequences" ON note_sequences
   FOR UPDATE TO authenticated
   USING (
     EXISTS (
       SELECT 1 FROM settings s
-      WHERE s.id = note_sequences.project_id
+      WHERE s.id = project_id
+      AND s.user_id = auth.uid()
+      AND s.deleted_at IS NULL
+    )
+  )
+  WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM settings s
+      WHERE s.id = project_id
       AND s.user_id = auth.uid()
       AND s.deleted_at IS NULL
     )
   );
 
-CREATE POLICY "Users can delete own note_sequences" ON note_sequences
+CREATE POLICY "Users can delete own note sequences" ON note_sequences
   FOR DELETE TO authenticated
   USING (
     EXISTS (
       SELECT 1 FROM settings s
-      WHERE s.id = note_sequences.project_id
+      WHERE s.id = project_id
       AND s.user_id = auth.uid()
       AND s.deleted_at IS NULL
     )
   );
 
--- Grant execute permissions
-GRANT EXECUTE ON FUNCTION move_note(uuid, uuid, integer) TO authenticated;
-GRANT EXECUTE ON FUNCTION delete_note_tree(uuid) TO authenticated;
-GRANT EXECUTE ON FUNCTION soft_delete_project(uuid) TO authenticated;
-GRANT EXECUTE ON FUNCTION restore_project(uuid) TO authenticated;
+-- Create RLS policies for storage
+CREATE POLICY "Users can upload note images"
+  ON storage.objects
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    bucket_id = 'note-images' AND
+    (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+CREATE POLICY "Anyone can view note images"
+  ON storage.objects
+  FOR SELECT
+  TO public
+  USING (bucket_id = 'note-images');
+
+CREATE POLICY "Users can delete their note images"
+  ON storage.objects
+  FOR DELETE
+  TO authenticated
+  USING (
+    bucket_id = 'note-images' AND
+    (storage.foldername(name))[1] = auth.uid()::text
+  );
