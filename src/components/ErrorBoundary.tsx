@@ -1,9 +1,8 @@
-import React, { Component, ErrorInfo } from 'react';
-import { AlertTriangle, RefreshCw } from 'lucide-react';
-import { handleError } from '../lib/errors';
+
+import React, { Component, ErrorInfo, ReactNode } from 'react';
 
 interface Props {
-  children: React.ReactNode;
+  children: ReactNode;
 }
 
 interface State {
@@ -14,47 +13,47 @@ interface State {
 export class ErrorBoundary extends Component<Props, State> {
   public state: State = {
     hasError: false,
-    error: null
+    error: null,
   };
 
+  // Handle synchronous errors
   public static getDerivedStateFromError(error: Error): State {
-    return { hasError: true, error: handleError(error) };
+    return { hasError: true, error };
   }
 
-  public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+  public componentDidMount(): void {
+    // Handle Promise rejection errors
+    window.addEventListener('unhandledrejection', this.handlePromiseRejection);
+  }
+
+  public componentWillUnmount(): void {
+    window.removeEventListener('unhandledrejection', this.handlePromiseRejection);
+  }
+
+  private handlePromiseRejection = (event: PromiseRejectionEvent): void => {
+    console.error('Unhandled Promise rejection:', event.reason);
+    this.setState({
+      hasError: true,
+      error: event.reason instanceof Error ? event.reason : new Error(String(event.reason)),
+    });
+  };
+
+  public componentDidCatch(error: Error, errorInfo: ErrorInfo): void {
     console.error('Uncaught error:', error, errorInfo);
   }
 
-  private handleRetry = () => {
-    this.setState({ hasError: false, error: null });
-    window.location.reload();
-  };
-
-  public render() {
+  public render(): ReactNode {
     if (this.state.hasError) {
       return (
-        <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
-          <div className="max-w-md w-full bg-white p-8 rounded-xl shadow-lg text-center">
-            <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
-              <AlertTriangle className="w-8 h-8 text-red-600" />
-            </div>
-            <h2 className="text-2xl font-bold text-gray-900 mb-2">Something went wrong</h2>
-            <p className="text-gray-600 mb-2">
-              {this.state.error?.message || 'An unexpected error occurred'}
-            </p>
-            {this.state.error?.cause && (
-              <p className="text-sm text-gray-500 mb-6">
-                {this.state.error.cause.message}
-              </p>
-            )}
-            <button
-              onClick={this.handleRetry}
-              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2 mx-auto"
-            >
-              <RefreshCw className="w-4 h-4" />
-              <span>Reload application</span>
-            </button>
-          </div>
+        <div className="p-4 m-4 bg-red-100 border border-red-400 text-red-700 rounded">
+          <h2 className="text-xl font-bold mb-2">Something went wrong</h2>
+          <details className="whitespace-pre-wrap">
+            <summary className="cursor-pointer">Error details</summary>
+            <p className="mt-2">{this.state.error?.message}</p>
+            <pre className="mt-2 text-sm overflow-auto bg-red-50 p-2 rounded">
+              {this.state.error?.stack}
+            </pre>
+          </details>
         </div>
       );
     }
